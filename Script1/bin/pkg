@@ -1,0 +1,417 @@
+#!/bin/sh
+
+# Diretórios padrão
+PREFIX="/usr/local"
+REPO_DIR="${PKG_REPO:-/repo}"
+CACHE_DIR="${PKG_CACHE:-/var/cache/pkg}"
+VAR_DIR="${PKG_VAR:-/var/lib/pkg}"
+LOG_DIR="$VAR_DIR/logs"
+INSTALLED_DB="$VAR_DIR/installed.db"
+LOCK_DIR="$VAR_DIR/locks"
+BUILD_DIR="$VAR_DIR/build"
+TMP_DIR="$VAR_DIR/tmp"
+
+# Cores para saída (opcional, fallback sem cores)
+if [ -t 1 ]; then
+  RED='\u001B[0;31m'
+  GREEN='\u001B[0;32m'
+  YELLOW='\u001B[1;33m'
+  BLUE='\u001B[0;34m'
+  NC='\u001B[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' NC=''
+fi
+
+# Níveis de log
+LOG_LEVEL=1  # 0=silent, 1=info, 2=debug
+
+log() {
+  local level="$1" msg="$2"
+  [ "$level" -gt "$LOG_LEVEL" ] && return
+  printf '%s [%s] %s
+' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg" | tee -a "$LOG_DIR/pkg.log"
+}
+
+debug() { log 2 "DEBUG: $1"; }
+info() { log 1 "INFO: $1"; }
+warn() { printf "${YELLOW}WARN:${NC} $1
+" | tee -a "$LOG_DIR/pkg.log"; }
+error() { printf "${RED}ERROR:${NC} $1
+" >&2 | tee -a "$LOG_DIR/pkg.log"; }
+fatal() { error "$1"; exit 1; }
+
+# Inicialização
+init_dirs() {
+  mkdir -p "$REPO_DIR" "$CACHE_DIR" "$VAR_DIR" "$LOG_DIR" "$LOCK_DIR" "$BUILD_DIR" "$TMP_DIR" || fatal "Falha ao criar diretórios"
+  : > "$INSTALLED_DB"  # Arquivo vazio se não existir
+}
+
+# Lock para programa
+lock_pkg() {
+  local pkg="$1" action="$2"  # action: acquire/release
+  local lockfile="$LOCK_DIR/$pkg.lock"
+  case "$action" in
+    acquire)
+      exec 9>"$lockfile" || fatal "Lock falhou para $pkg"
+      flock -n 9 || { warn "Outro processo buildando $pkg"; return 1; }
+      ;;
+    release)
+      exec 9>"$lockfile"
+      flock -u 9 2>/dev/null
+      rm -f "$lockfile"
+      ;;
+  esac
+}
+
+# Parse meta para pkg
+parse_meta() {
+  local pkgdir="$1" pkg="$2"
+  local meta="$pkgdir/meta"
+  [ ! -f "$meta" ] && fatal "meta não encontrado em $meta"
+
+  # name:vers:src:depends:md5 (uma linha)
+  read name vers src depends md5sum < "$meta" || fatal "meta inválido para $pkg"
+  [ "$name" != "$pkg" ] && fatal "Nome no meta ($name) != $pkg"
+
+  printf '%s
+%s
+%s
+%s
+%s' "$vers" "$src" "$depends" "$md5sum"
+}
+
+# Obter versão instalada
+get_installed_ver() {
+  local pkg="$1"
+  grep "^$pkg:" "$INSTALLED_DB" 2>/dev/null | cut -d: -f2
+}
+
+# Registrar instalado: pkg:vers:pkgdir:tarball
+register_pkg() {
+  local pkg="$1" vers="$2" pkgdir="$3" tarball="$4"
+  printf '%s:%s:%s:%s
+' "$pkg" "$vers" "$pkgdir" "$tarball" >> "$INSTALLED_DB"
+  sort -u -o "$INSTALLED_DB" "$INSTALLED_DB"  # Dedup e sort
+}
+
+# Desregistrar
+unregister_pkg() {
+  local pkg="$1"
+  grep -v "^$pkg:" "$INSTALLED_DB" > "$INSTALLED_DB.tmp" && mv "$INSTALLED_DB.tmp" "$INSTALLED_DB"
+}
+
+# Download e cache source com md5
+download_src() {
+  local src="$1" pkg="$2" md5exp="$3" cachedir="$CACHE_DIR/src"
+  mkdir -p "$cachedir"
+  local fname="${src##*/}"
+  local cachefile="$cachedir/$fname"
+
+  if [ -f "$cachefile" ] && md5sum_check "$cachefile" "$md5exp"; then
+    debug "Source cached: $fname"
+    echo "$cachefile"
+    return 0
+  fi
+
+  info "Baixando $src"
+  curl -L -f -o "$cachefile.tmp" "$src" || { rm -f "$cachefile.tmp"; fatal "Falha download $src"; }
+  mv "$cachefile.tmp" "$cachefile"
+
+  md5sum_check "$cachefile" "$md5exp" || fatal "MD5 falhou para $fname (exp $md5exp)"
+  echo "$cachefile"
+}
+
+md5sum_check() {
+  local file="$1" exp="$2"
+  [ -z "$exp" ] && return 0  # Sem md5, ok
+  echo "$exp  $file" | md5sum -c --quiet >/dev/null 2>&1
+}
+
+# Aplicar patches
+apply_patches() {
+  local srcdir="$1" pkgdir="$2"
+  local patches="$pkgdir/patches"
+  [ ! -d "$patches" ] && return 0
+  for p in "$patches"/*.patch "$patches"/*.diff 2>/dev/null || :; do
+    info "Aplicando patch $p"
+    patch -d "$srcdir" -p1 < "$p" || warn "Patch $p falhou parcialmente"
+  done
+}
+
+# Aplicar hooks (scripts executáveis)
+apply_hooks() {
+  local srcdir="$1" pkgdir="$2" stage="$3"  # stage: pre-build, post-build, pre-install, post-install
+  local hooks="$pkgdir/hooks/$stage"
+  [ ! -d "$hooks" ] && return 0
+  for hook in "$hooks"/*; do
+    [ -x "$hook" ] || continue
+    info "Executando hook $stage: ${hook##*/}"
+    "$hook" "$srcdir" || warn "Hook ${hook##*/} falhou"
+  done
+}
+
+# Build autotools/make inteligente
+auto_build() {
+  local srcdir="$1" destdir="$2" pkg="$3"
+  cd "$srcdir" || return 1
+
+  # Detect autotools
+  if [ -f configure ] || [ -f configure.ac ]; then
+    info "Autotools detectado para $pkg"
+    ./configure --prefix="$PREFIX" || fatal "configure falhou"
+    make -j"$(nproc)" || fatal "make falhou"
+    make DESTDIR="$destdir" install || fatal "make install falhou"
+    return 0
+  fi
+
+  # CMake fallback (se cmake presente, mas foco autotools)
+  if command -v cmake >/dev/null && [ -f CMakeLists.txt ]; then
+    info "CMake detectado para $pkg"
+    cmake -DCMAKE_INSTALL_PREFIX="$PREFIX" .
+    make -j"$(nproc)"
+    make DESTDIR="$destdir" install
+    return 0
+  fi
+
+  fatal "Sem build detectado e sem build script para $pkg"
+}
+
+# Build pkg
+do_build() {
+  local pkg="$1" pkgdir="$REPO_DIR/$pkg" destdir="$BUILD_DIR/$pkg.dest"
+  local vers src depends md5sum
+  { vers="$1"; src="$2"; depends="$3"; md5sum="$4"; } < <(parse_meta "$pkgdir" "$pkg")
+
+  rm -rf "$destdir"
+  mkdir -p "$destdir"
+
+  local srcfile="$(download_src "$src" "$pkg" "$md5sum")"
+  local srcdir="$TMP_DIR/${pkg}_src"
+  rm -rf "$srcdir"
+  tar -xof "$srcfile" -C "$TMP_DIR" && mv "$TMP_DIR/${srcfile##*/}"* "$srcdir" || fatal "Extrair falhou"
+
+  apply_patches "$srcdir" "$pkgdir"
+  apply_hooks "$srcdir" "$pkgdir" pre-build
+
+  if [ -x "$pkgdir/build" ]; then
+    info "Usando build script custom para $pkg"
+    DESTDIR="$destdir" "$pkgdir/build" "$srcdir" || fatal "build script falhou"
+  else
+    auto_build "$srcdir" "$destdir" "$pkg"
+  fi
+
+  apply_hooks "$srcdir" "$pkgdir" post-build
+  apply_hooks "$destdir" "$pkgdir" pre-install
+  echo "$destdir"  # Retorna destdir
+}
+
+# Empacotar destdir em tarball
+package_destdir() {
+  local destdir="$1" pkg="$2" vers="$3"
+  local tarball="$CACHE_DIR/${pkg}-${vers}.tar.gz"
+  tar -czf "$tarball" -C "$destdir" . || fatal "Empacotamento falhou"
+  echo "$tarball"
+}
+
+# Resolver dependências com topo sort e ciclo detect
+resolve_deps() {
+  local pkgs="$1"  # espaço separada
+  local order="" visited="" recstack=""
+
+  # Graph: pkg -> list deps
+  build_graph() {
+    local g="$1"
+    for p in $pkgs; do
+      pkgdir="$REPO_DIR/$p"
+      depends="$(parse_meta "$pkgdir" "$p" | sed -n 3p)"
+      printf '%s %s
+' "$p" "$depends" >> "$g"
+    done
+  }
+
+  detect_cycle_dfs() {
+    local node="$1" graph="$2" visiting="$3" visited="$4"
+    recstack="$visiting $node"
+    for dep in $(awk -v n="$node " '$1 == n {for(i=2;i<=NF;i++) print $i}' "$graph" 2>/dev/null | tr '
+' ' ' | xargs); do
+      case $(contains "$visited" "$dep") in 1) continue;; esac
+      case $(contains "$recstack" "$dep") in 1) echo "Ciclo detectado: ... -> $node -> $dep"; return 1;; esac
+      detect_cycle_dfs "$dep" "$graph" "$recstack" "$visited" || return 1
+    done
+    visited="$visited $node"
+  }
+
+  topo_dfs() {
+    local node="$1" graph="$2" visiting="$3" visited="$4" order="$5"
+    visiting="$visiting $node"
+    for dep in $(awk -v n="$node " '$1 == n {for(i=2;i<=NF;i++) print $i}' "$graph"); do
+      case $(contains "$visited" "$dep") in 1) continue;; esac
+      case $(contains "$visiting" "$dep") in 1) return 1;; esac  # ciclo
+      topo_dfs "$dep" "$graph" "$visiting" "$visited" "$order" || return 1
+    done
+    order="$node $order"
+  }
+
+  contains() {
+    local hay="$1" needle="$2"
+    echo "$hay" | tr ' ' '
+' | grep -Fx "$needle" >/dev/null && echo 1 || echo 0
+  }
+
+  local graph="$TMP_DIR/graph.tmp"
+  build_graph "$graph"
+
+  for p in $pkgs; do
+    [ "$(contains "$visited" "$p")" = 1 ] && continue
+    detect_cycle_dfs "$p" "$graph" "" "$visited" || { rm -f "$graph"; fatal "Ciclo em dependências para $pkgs"; }
+  done
+
+  visited=""
+  for p in $pkgs; do
+    [ "$(contains "$visited" "$p")" = 1 ] && continue
+    topo_dfs "$p" "$graph" "" "$visited" "$order" || fatal "Topo sort falhou (ciclo)"
+    visited="$visited $p"
+  done
+
+  rm -f "$graph"
+  echo "$order"
+}
+
+# Comando install
+cmd_install() {
+  local pkg="$1" from_cache=0 srcpath=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in --cache|-c) from_cache=1;; --src|-s) srcpath="$2"; shift;; esac
+    shift
+  done
+
+  verinst=$(get_installed_ver "$pkg")
+  [ -n "$verinst" ] && { info "$pkg v$verinst já instalado"; return 0; }
+
+  deps=$(resolve_deps "$pkg $(parse_meta "$REPO_DIR/$pkg" "$pkg" | sed -n 3p)")
+  for d in $deps; do
+    cmd_install "$d" || return 1
+  done
+
+  local destdir tarball
+  if [ $from_cache = 1 ] || [ -n "$srcpath" ]; then
+    if [ -n "$srcpath" ]; then
+      tarball="$srcpath"
+    else
+      tarball="$CACHE_DIR/${pkg}-*.tar.gz"  # Wildcard simples
+      [ -f "$tarball" ] || { error "Cache não encontrado"; return 1; }
+    fi
+    destdir="$BUILD_DIR/${pkg}_inst"
+    rm -rf "$destdir" && mkdir -p "$destdir"
+    tar -xzf "$tarball" -C "$destdir"
+  else
+    destdir=$(do_build "$pkg")
+    tarball=$(package_destdir "$destdir" "$pkg" "$(parse_meta "$REPO_DIR/$pkg" "$pkg" | sed -n 1p)")
+  fi
+
+  apply_hooks "$destdir" "$REPO_DIR/$pkg" post-install
+
+  # Instalar real (rsync para idempotente)
+  rsync -a --delete "$destdir/" / || fatal "Instalação falhou"
+
+  vers="$(parse_meta "$REPO_DIR/$pkg" "$pkg" | sed -n 1p)"
+  register_pkg "$pkg" "$vers" "$REPO_DIR/$pkg" "$tarball"
+
+  info "Instalado $pkg v$vers"
+}
+
+# Comando uninstall
+cmd_uninstall() {
+  local pkg="$1"
+  local vers="$(get_installed_ver "$pkg")"
+  [ -z "$vers" ] && { warn "$pkg não instalado"; return 0; }
+
+  # Pkgdir do registro
+  pkgdir="$(grep "^$pkg:" "$INSTALLED_DB" | cut -d: -f3)"
+  tarball="$(grep "^$pkg:" "$INSTALLED_DB" | cut -d: -f4)"
+
+  # Dry-run?
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY: Desinstalar $pkg v$vers de $PREFIX/*"
+    return 0
+  fi
+
+  # Uninstall hook primeiro
+  [ -d "$pkgdir/hooks/uninstall" ] && {
+    for h in "$pkgdir/hooks/uninstall"/*; do [ -x "$h" ] && "$h"; done
+  }
+
+  # Remover arquivos (do tarball para precisão)
+  tar -tzf "$tarball" | while read f; do
+    rm -rf "/$f"
+  done
+
+  unregister_pkg "$pkg"
+  info "Desinstalado $pkg"
+}
+
+# Comando upgrade (reinstall se nova vers)
+cmd_upgrade() {
+  local pkg="$1"
+  cmd_uninstall "$pkg"
+  cmd_install "$pkg"
+}
+
+# Comando search
+cmd_search() {
+  local query="$1"
+  find "$REPO_DIR" -maxdepth 2 -name "meta" -exec grep -l "^$query:" {} ; | xargs -r dirname | sed "s|$REPO_DIR/||"
+}
+
+# Comando clean
+cmd_clean() {
+  info "Limpando cache e tmp"
+  rm -rf "$CACHE_DIR/src/"* "$CACHE_DIR/"*.tar.gz "$TMP_DIR/"* "$BUILD_DIR/"*
+}
+
+# Comando build
+cmd_build() {
+  local pkg="$1"
+  lock_pkg "$pkg" acquire || return 1
+  trap 'lock_pkg "$pkg" release' EXIT INT TERM
+  do_build "$pkg" >/dev/null  # Logs já
+  vers="$(parse_meta "$REPO_DIR/$pkg" "$pkg" | sed -n 1p)"
+  tarball=$(package_destdir "$BUILD_DIR/$pkg.dest" "$pkg" "$vers")
+  register_pkg "$pkg" "$vers" "$REPO_DIR/$pkg" "$tarball"  # Registra mesmo se não instalado
+  info "Build e cache $pkg v$vers em $tarball"
+}
+
+# Dry-run flag
+DRY_RUN=0
+
+# Main parser
+main() {
+  init_dirs
+  case "$1" in
+    install) shift; cmd_install "$@";;
+    uninstall|remove) shift; cmd_uninstall "$@";;
+    upgrade) shift; cmd_upgrade "$@";;
+    build) shift; cmd_build "$@";;
+    search|find) shift; cmd_search "$@";;
+    clean) shift; cmd_clean;;
+    -n|--dry-run) DRY_RUN=1; exec "$0" "$@";;
+    -d|--debug) LOG_LEVEL=2; shift; exec "$0" "$@";;
+    -h|--help)
+      cat <<EOF
+Uso: $0 <cmd> [opcs]
+cmds:
+  install PKG [--cache | --src TAR]
+  uninstall PKG
+  build PKG
+  upgrade PKG
+  search QUERY
+  clean
+  --dry-run
+EOF
+      ;;
+    *) fatal "Comando desconhecido: $1. Veja --help";;
+  esac
+}
+
+main "$@"
