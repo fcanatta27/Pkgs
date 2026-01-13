@@ -1,0 +1,167 @@
+BKLINUX – TUTORIAL COMPLETO
+PUBLICAÇÃO DE repo/stable VIA HTTPS
+==================================
+
+Este documento é MONOLÍTICO (um único arquivo .txt) e descreve,
+passo a passo, COMO PUBLICAR UM REPOSITÓRIO BK (repo/stable)
+VIA HTTPS e COMO USÁ-LO EM UM SISTEMA BKLINUX JÁ INSTALADO.
+
+Nada aqui depende de systemd no BKLinux.
+Todos os exemplos são reais e práticos.
+
+----------------------------------------------------------------
+SUMÁRIO
+----------------------------------------------------------------
+1. Conceitos básicos do repo BK
+2. Estrutura obrigatória do repo/stable
+3. Gerando o repositório local
+4. Publicação HTTPS – Visão geral
+5. HTTPS com Nginx + Let’s Encrypt (recomendado)
+6. HTTPS com certificado próprio (self-signed)
+7. Testes do servidor HTTPS
+8. Instalação do certificado CA no BKLinux
+9. Configuração do BKLinux para usar HTTPS
+10. Execução do bk update
+11. Diagnóstico de erros comuns
+12. Boas práticas de segurança
+13. Checklist final
+
+----------------------------------------------------------------
+1. CONCEITOS BÁSICOS DO REPO BK
+----------------------------------------------------------------
+
+O BKLinux utiliza um repositório extremamente simples.
+Não existe banco de dados remoto nem resolução automática
+de dependências.
+
+O comando bk update apenas:
+- baixa VERSION
+- baixa packages.txt
+- compara versões
+- baixa pacotes .tar.xz
+- instala ou atualiza
+
+----------------------------------------------------------------
+2. ESTRUTURA OBRIGATÓRIA DO repo/stable
+----------------------------------------------------------------
+
+A estrutura abaixo é fixa:
+
+repo/
+└── stable/
+    ├── VERSION
+    ├── packages.txt
+    ├── SHA256SUMS
+    └── pkgs/
+        ├── gcc-15.2.0.tar.xz
+        ├── jwm-2.4.3.tar.xz
+        └── ...
+
+----------------------------------------------------------------
+3. GERANDO O REPOSITÓRIO LOCAL
+----------------------------------------------------------------
+
+No host de build:
+
+scripts/build-repo.sh
+
+Isso gera automaticamente:
+- packages.txt
+- SHA256SUMS
+- VERSION
+
+----------------------------------------------------------------
+4. PUBLICAÇÃO HTTPS – VISÃO GERAL
+----------------------------------------------------------------
+
+O BKLinux acessa o repositório por HTTPS:
+https://SERVIDOR/stable/
+
+----------------------------------------------------------------
+5. HTTPS COM NGINX + LET’S ENCRYPT
+----------------------------------------------------------------
+
+5.1 Instalar nginx
+
+Debian/Ubuntu:
+apt install nginx
+
+5.2 Copiar o repositório
+
+mkdir -p /var/www/bklinux
+cp -a repo/stable /var/www/bklinux/
+
+5.3 Configuração básica nginx
+
+server {
+    listen 80;
+    server_name repo.exemplo.com;
+    root /var/www/bklinux;
+}
+
+5.4 Ativar HTTPS
+
+certbot --nginx -d repo.exemplo.com
+
+----------------------------------------------------------------
+6. CERTIFICADO PRÓPRIO (SELF-SIGNED)
+----------------------------------------------------------------
+
+openssl req -x509 -newkey rsa:4096 \
+  -keyout bklinux.key \
+  -out bklinux.crt \
+  -days 365 \
+  -nodes \
+  -subj "/CN=bklinux-repo"
+
+----------------------------------------------------------------
+7. TESTAR HTTPS
+----------------------------------------------------------------
+
+curl https://repo.exemplo.com/stable/VERSION
+
+----------------------------------------------------------------
+8. INSTALAR CA NO BKLINUX
+----------------------------------------------------------------
+
+scp bklinux.crt root@bklinux:/usr/local/share/ca-certificates/
+update-ca-certificates
+
+----------------------------------------------------------------
+9. CONFIGURAR BK_REPO_URL
+----------------------------------------------------------------
+
+export BK_REPO_URL="https://repo.exemplo.com"
+export BK_CHANNEL="stable"
+
+----------------------------------------------------------------
+10. EXECUTAR UPDATE
+----------------------------------------------------------------
+
+bk update
+
+----------------------------------------------------------------
+11. ERROS COMUNS
+----------------------------------------------------------------
+
+Erro TLS: CA não confiável
+Solução: instalar certificado corretamente
+
+----------------------------------------------------------------
+12. BOAS PRÁTICAS
+----------------------------------------------------------------
+
+- Use HTTPS sempre
+- Mantenha SHA256SUMS atualizado
+- Separe testing e stable
+
+----------------------------------------------------------------
+13. CHECKLIST FINAL
+----------------------------------------------------------------
+
+[ ] HTTPS funcional
+[ ] repo/stable correto
+[ ] BK_REPO_URL configurado
+[ ] bk update funcionando
+
+FIM
